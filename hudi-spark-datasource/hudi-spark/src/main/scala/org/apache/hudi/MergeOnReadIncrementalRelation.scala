@@ -201,7 +201,20 @@ class MergeOnReadIncrementalRelation(val sqlContext: SQLContext,
       val baseFiles = f.getAllFileSlices.iterator().filter(slice => slice.getBaseFile.isPresent).toList
       val partitionedFile = if (baseFiles.nonEmpty) {
         val baseFile = baseFiles.head.getBaseFile
-        Option(PartitionedFile(InternalRow.empty, baseFile.get.getPath, 0, baseFile.get.getFileLen))
+        // Here we use the Path#toUri to encode the path string, as there is a decode in
+        // ParquetFileFormat#buildReaderWithPartitionValues in the spark project when read the table
+        // .So we should encode the file path here. Otherwise, there is a FileNotException throw
+        // out.
+        // For example, If the "pt" is the partition path field, and "pt" = "2021/02/02", If
+        // we enable the URL_ENCODE_PARTITIONING_OPT_KEY and write data to hudi table.The data
+        // path in the table will just like "/basePath/2021%2F02%2F02/xxxx.parquet". When we read
+        // data from the table, if there are no encode for the file path,
+        // ParquetFileFormat#buildReaderWithPartitionValues will decode it to
+        // "/basePath/2021/02/02/xxxx.parquet" witch will result to a FileNotException.
+        // See FileSourceScanExec#createBucketedReadRDD in spark project which do the same thing
+        // when create PartitionedFile.
+        val filePath = baseFile.get.getFileStatus.getPath.toUri.toString
+        Option(PartitionedFile(InternalRow.empty, filePath, 0, baseFile.get.getFileLen))
       }
       else {
         Option.empty

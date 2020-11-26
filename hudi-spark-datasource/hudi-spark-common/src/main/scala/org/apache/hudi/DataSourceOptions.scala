@@ -349,6 +349,8 @@ object DataSourceWriteOptions {
   val HIVE_AUTO_CREATE_DATABASE_OPT_KEY = "hoodie.datasource.hive_sync.auto_create_database"
   val HIVE_SKIP_RO_SUFFIX = "hoodie.datasource.hive_sync.skip_ro_suffix"
   val HIVE_SUPPORT_TIMESTAMP = "hoodie.datasource.hive_sync.support_timestamp"
+  val HIVE_TABLE_PROPERTIES = "hoodie.datasource.hive_sync.table_properties"
+  val HIVE_TABLE_SERDE_PROPERTIES = "hoodie.datasource.hive_sync.serde_properties"
 
   // DEFAULT FOR HIVE SPECIFIC CONFIGS
   val DEFAULT_HIVE_SYNC_ENABLED_OPT_VAL = "false"

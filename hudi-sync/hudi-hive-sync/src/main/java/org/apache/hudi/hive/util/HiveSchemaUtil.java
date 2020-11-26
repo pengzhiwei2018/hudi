@@ -395,7 +395,7 @@ public class HiveSchemaUtil {
   }
 
   public static String generateCreateDDL(String tableName, MessageType storageSchema, HiveSyncConfig config, String inputFormatClass,
-                                         String outputFormatClass, String serdeClass) throws IOException {
+                                         String outputFormatClass, String serdeClass, Map<String, String> serdeProperties) throws IOException {
     Map<String, String> hiveSchema = convertParquetSchemaToHiveSchema(storageSchema, config.supportTimestamp);
     String columns = generateSchemaString(storageSchema, config.partitionFields, config.supportTimestamp);
 
@@ -415,6 +415,18 @@ public class HiveSchemaUtil {
       sb.append(" PARTITIONED BY (").append(partitionsStr).append(")");
     }
     sb.append(" ROW FORMAT SERDE '").append(serdeClass).append("'");
+    if (serdeProperties != null && serdeProperties.size() > 0) {
+      sb.append("WITH SERDEPROPERTIES (");
+      boolean first = true;
+      for (Map.Entry<String, String> entry : serdeProperties.entrySet()) {
+        if (!first) {
+          sb.append(",");
+        }
+        sb.append("'").append(entry.getKey()).append("'='").append(entry.getValue()).append("'");
+        first = false;
+      }
+      sb.append(")");
+    }
     sb.append(" STORED AS INPUTFORMAT '").append(inputFormatClass).append("'");
     sb.append(" OUTPUTFORMAT '").append(outputFormatClass).append("' LOCATION '").append(config.basePath).append("'");
     return sb.toString();

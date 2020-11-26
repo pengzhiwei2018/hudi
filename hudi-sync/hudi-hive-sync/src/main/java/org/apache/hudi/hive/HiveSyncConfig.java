@@ -85,6 +85,12 @@ public class HiveSyncConfig implements Serializable {
   @Parameter(names = {"--verify-metadata-file-listing"}, description = "Verify file listing from Hudi's metadata against file system")
   public Boolean verifyMetadataFileListing = HoodieMetadataConfig.DEFAULT_METADATA_VALIDATE;
 
+  @Parameter(names = {"--table-properties"}, description = "Table properties to hive table")
+  public String tableProperties;
+
+  @Parameter(names = {"--serde-properties"}, description = "Serde properties to hive table")
+  public String serdeProperties;
+
   @Parameter(names = {"--help", "-h"}, help = true)
   public Boolean help = false;
 
@@ -111,6 +117,8 @@ public class HiveSyncConfig implements Serializable {
     newConfig.verifyMetadataFileListing = cfg.verifyMetadataFileListing;
     newConfig.supportTimestamp = cfg.supportTimestamp;
     newConfig.decodePartition = cfg.decodePartition;
+    newConfig.tableProperties = cfg.tableProperties;
+    newConfig.serdeProperties = cfg.serdeProperties;
     return newConfig;
   }
 

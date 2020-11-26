@@ -37,6 +37,7 @@ import org.apache.hudi.common.util.ReflectionUtils
 import org.apache.hudi.config.HoodieBootstrapConfig.{BOOTSTRAP_BASE_PATH_PROP, BOOTSTRAP_INDEX_CLASS_PROP, DEFAULT_BOOTSTRAP_INDEX_CLASS}
 import org.apache.hudi.config.HoodieWriteConfig
 import org.apache.hudi.exception.HoodieException
+import org.apache.hudi.hive.util.ConfigUtils
 import org.apache.hudi.hive.{HiveSyncConfig, HiveSyncTool}
 import org.apache.hudi.internal.{DataSourceInternalWriterHelper, HoodieDataSourceInternalWriter}
 import org.apache.hudi.sync.common.AbstractSyncTool
@@ -45,7 +46,10 @@ import org.apache.spark.SPARK_VERSION
 import org.apache.spark.SparkContext
 import org.apache.spark.api.java.JavaSparkContext
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.{DataFrame, SQLContext, SaveMode}
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.internal.StaticSQLConf.SCHEMA_STRING_LENGTH_THRESHOLD
+import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.{DataFrame, SQLContext, SaveMode, SparkSession}
 
 import scala.collection.JavaConversions._
 import scala.collection.mutable.ListBuffer
@@ -214,7 +218,8 @@ private[hudi] object HoodieSparkSqlWriter {
 
       // Check for errors and commit the write.
       val (writeSuccessful, compactionInstant) =
-        commitAndPerformPostOperations(writeResult, parameters, writeClient, tableConfig, jsc,
+        commitAndPerformPostOperations(sqlContext.sparkSession, df.schema,
+          writeResult, parameters, writeClient, tableConfig, jsc,
           TableInstantInfo(basePath, instantTime, commitActionType, operation))
       (writeSuccessful, common.util.Option.ofNullable(instantTime), compactionInstant, writeClient, tableConfig)
     }
@@ -275,7 +280,10 @@ private[hudi] object HoodieSparkSqlWriter {
     } finally {
       writeClient.close()
     }
-    val metaSyncSuccess = metaSync(parameters, basePath, jsc.hadoopConfiguration)
+    val newParameters =
+      addSqlTableProperties(sqlContext.sparkSession.sessionState.conf, df.schema, parameters)
+    val metaSyncSuccess = metaSync(newParameters, basePath,
+      sqlContext.sparkSession.sessionState.newHadoopConf())
     metaSyncSuccess
   }
 
@@ -309,7 +317,9 @@ private[hudi] object HoodieSparkSqlWriter {
     val hiveSyncEnabled = parameters.get(HIVE_SYNC_ENABLED_OPT_KEY).exists(r => r.toBoolean)
     val metaSyncEnabled = parameters.get(META_SYNC_ENABLED_OPT_KEY).exists(r => r.toBoolean)
     val syncHiveSucess = if (hiveSyncEnabled || metaSyncEnabled) {
-      metaSync(parameters, basePath, sqlContext.sparkContext.hadoopConfiguration)
+      val newParameters =
+        addSqlTableProperties(sqlContext.sparkSession.sessionState.conf, df.schema, parameters)
+      metaSync(newParameters, basePath, sqlContext.sparkSession.sessionState.newHadoopConf())
     } else {
       true
     }
@@ -349,7 +359,8 @@ private[hudi] object HoodieSparkSqlWriter {
     }
   }
 
-  private def syncHive(basePath: Path, fs: FileSystem, parameters: Map[String, String]): Boolean = {
+  private def syncHive(basePath: Path, fs: FileSystem, parameters: Map[String, String],
+                       hadoopConf: Configuration): Boolean = {
     val hiveSyncConfig: HiveSyncConfig = buildSyncConfig(basePath, parameters)
     val hiveConf: HiveConf = new HiveConf()
     hiveConf.addResource(fs.getConf)
@@ -360,7 +371,7 @@ private[hudi] object HoodieSparkSqlWriter {
   private def buildSyncConfig(basePath: Path, parameters: Map[String, String]): HiveSyncConfig = {
     val hiveSyncConfig: HiveSyncConfig = new HiveSyncConfig()
     hiveSyncConfig.basePath = basePath.toString
-    hiveSyncConfig.baseFileFormat = parameters(HIVE_BASE_FILE_FORMAT_OPT_KEY);
+    hiveSyncConfig.baseFileFormat = parameters(HIVE_BASE_FILE_FORMAT_OPT_KEY)
     hiveSyncConfig.usePreApacheInputFormat =
       parameters.get(HIVE_USE_PRE_APACHE_INPUT_FORMAT_OPT_KEY).exists(r => r.toBoolean)
     hiveSyncConfig.databaseName = parameters(HIVE_DATABASE_OPT_KEY)
@@ -378,11 +389,75 @@ private[hudi] object HoodieSparkSqlWriter {
     hiveSyncConfig.autoCreateDatabase = parameters.get(HIVE_AUTO_CREATE_DATABASE_OPT_KEY).exists(r => r.toBoolean)
     hiveSyncConfig.decodePartition = parameters.getOrElse(URL_ENCODE_PARTITIONING_OPT_KEY,
       DEFAULT_URL_ENCODE_PARTITIONING_OPT_VAL).toBoolean
+    hiveSyncConfig.tableProperties = parameters.getOrElse(HIVE_TABLE_PROPERTIES, null)
+    hiveSyncConfig.serdeProperties = createSqlTableSerdeProperties(parameters, basePath.toString,
+      hiveSyncConfig.partitionFields.size())
     hiveSyncConfig
   }
 
-  private def metaSync(parameters: Map[String, String],
-                       basePath: Path,
+  /**
+    * Add Spark Sql related table properties to the HIVE_TABLE_PROPERTIES.
+    * @param sqlConf
+    * @param schema
+    * @param parameters
+    * @return A new parameters added the HIVE_TABLE_PROPERTIES property.
+    */
+  private def addSqlTableProperties(sqlConf: SQLConf, schema: StructType,
+                                    parameters: Map[String, String]): Map[String, String] = {
+    // Convert the schema and partition info used by spark sql to hive table properties.
+    // The following code refers to the spark code in
+    // https://github.com/apache/spark/blob/master/sql/hive/src/main/scala/org/apache/spark/sql/hive/HiveExternalCatalog.scala
+
+    val partitionSet = parameters(HIVE_PARTITION_FIELDS_OPT_KEY)
+      .split(",").map(_.trim).filter(!_.isEmpty).toSet
+    val threshold = sqlConf.getConf(SCHEMA_STRING_LENGTH_THRESHOLD)
+
+    val (partitionCols, dataCols) = schema.partition(c => partitionSet.contains(c.name))
+    val reOrderedType = StructType(dataCols ++ partitionCols)
+    val schemaParts = reOrderedType.json.grouped(threshold).toSeq
+
+    var properties = Map(
+      "spark.sql.sources.provider" -> "hudi",
+      "spark.sql.sources.schema.numParts" -> schemaParts.size.toString
+    )
+    schemaParts.zipWithIndex.foreach { case (part, index) =>
+      properties += s"spark.sql.sources.schema.part.$index" -> part
+    }
+    // add partition columns
+    if (partitionSet.nonEmpty) {
+      properties += "spark.sql.sources.schema.numPartCols" -> partitionSet.size.toString
+      partitionSet.zipWithIndex.foreach { case (partCol, index) =>
+        properties += s"spark.sql.sources.schema.partCol.$index" -> partCol
+      }
+    }
+    var sqlPropertyText = ConfigUtils.configToString(properties)
+    sqlPropertyText = if (parameters.containsKey(HIVE_TABLE_PROPERTIES)) {
+      sqlPropertyText + "\n" + parameters(HIVE_TABLE_PROPERTIES)
+    } else {
+      sqlPropertyText
+    }
+    parameters + (HIVE_TABLE_PROPERTIES -> sqlPropertyText)
+  }
+
+  private def createSqlTableSerdeProperties(parameters: Map[String, String],
+                                            basePath: String, pathDepth: Int): String = {
+    assert(pathDepth >= 0, "Path Depth must great or equal to 0")
+    var pathProp = s"path=$basePath"
+    if (pathProp.endsWith("/")) {
+      pathProp = pathProp.substring(0, pathProp.length - 1)
+    }
+    for (_ <- 0 until pathDepth + 1) {
+      pathProp = s"$pathProp/*"
+    }
+    if (parameters.containsKey(HIVE_TABLE_SERDE_PROPERTIES)) {
+      pathProp + "\n" + parameters(HIVE_TABLE_SERDE_PROPERTIES)
+    } else {
+      pathProp
+    }
+  }
+
+
+  private def metaSync(parameters: Map[String, String], basePath: Path,
                        hadoopConf: Configuration): Boolean = {
     val hiveSyncEnabled = parameters.get(HIVE_SYNC_ENABLED_OPT_KEY).exists(r => r.toBoolean)
     var metaSyncEnabled = parameters.get(META_SYNC_ENABLED_OPT_KEY).exists(r => r.toBoolean)
@@ -401,7 +476,7 @@ private[hudi] object HoodieSparkSqlWriter {
         val syncSuccess = impl.trim match {
           case "org.apache.hudi.hive.HiveSyncTool" => {
             log.info("Syncing to Hive Metastore (URL: " + parameters(HIVE_URL_OPT_KEY) + ")")
-            syncHive(basePath, fs, parameters)
+            syncHive(basePath, fs, parameters, hadoopConf)
             true
           }
           case _ => {
@@ -424,7 +499,9 @@ private[hudi] object HoodieSparkSqlWriter {
    */
   case class TableInstantInfo(basePath: Path, instantTime: String, commitActionType: String, operation: WriteOperationType)
 
-  private def commitAndPerformPostOperations(writeResult: HoodieWriteResult,
+  private def commitAndPerformPostOperations(spark: SparkSession,
+                                             schema: StructType,
+                                             writeResult: HoodieWriteResult,
                                              parameters: Map[String, String],
                                              client: SparkRDDWriteClient[HoodieRecordPayload[Nothing]],
                                              tableConfig: HoodieTableConfig,
@@ -458,7 +535,10 @@ private[hudi] object HoodieSparkSqlWriter {
         }
 
       log.info(s"Compaction Scheduled is $compactionInstant")
-      val metaSyncSuccess =  metaSync(parameters, tableInstantInfo.basePath, jsc.hadoopConfiguration())
+      val newParameters =
+        addSqlTableProperties(spark.sessionState.conf, schema, parameters)
+      val metaSyncSuccess =  metaSync(newParameters, tableInstantInfo.basePath,
+        spark.sessionState.newHadoopConf())
 
       log.info(s"Is Async Compaction Enabled ? $asyncCompactionEnabled")
       if (!asyncCompactionEnabled) {

@@ -101,9 +101,11 @@ public class HoodieDLAClient extends AbstractSyncHoodieClient {
   }
 
   @Override
-  public void createTable(String tableName, MessageType storageSchema, String inputFormatClass, String outputFormatClass, String serdeClass) {
+  public void createTable(String tableName, MessageType storageSchema, String inputFormatClass,
+                          String outputFormatClass, String serdeClass, Map<String, String> serdeProperties) {
     try {
-      String createSQLQuery = HiveSchemaUtil.generateCreateDDL(tableName, storageSchema, toHiveSyncConfig(), inputFormatClass, outputFormatClass, serdeClass);
+      String createSQLQuery = HiveSchemaUtil.generateCreateDDL(tableName, storageSchema, toHiveSyncConfig(),
+          inputFormatClass, outputFormatClass, serdeClass, serdeProperties);
       LOG.info("Creating table with " + createSQLQuery);
       updateDLASQL(createSQLQuery);
     } catch (IOException e) {
