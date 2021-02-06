@@ -135,6 +135,7 @@ public class HoodieWriteConfig extends DefaultHoodieConfig {
   private static final String MERGE_ALLOW_DUPLICATE_ON_INSERTS = "hoodie.merge.allow.duplicate.on.inserts";
   private static final String DEFAULT_MERGE_ALLOW_DUPLICATE_ON_INSERTS = "false";
 
+  public static final String WRITE_SCHEMA = "hoodie.write.schema";
   /**
    * HUDI-858 : There are users who had been directly using RDD APIs and have relied on a behavior in 0.4.x to allow
    * multiple write operations (upsert/buk-insert/...) to be executed within a single commit.
@@ -194,6 +195,22 @@ public class HoodieWriteConfig extends DefaultHoodieConfig {
   }
 
   public String getSchema() {
+    return props.getProperty(AVRO_SCHEMA);
+  }
+
+  /**
+   * The schema of the record we write to the table.
+   * In most case, the write schema is the same with
+   * the AVRO_SCHEMA. But in same case, when users do some
+   * logical transform in their {@link org.apache.hudi.common.model.HoodieRecordPayload},
+   * The schema of the write record may be different with the AVRO_SCHEMA.
+   * Users can specify it by the WRITE_SCHEMA config.
+   * @return
+   */
+  public String getWriteSchema() {
+    if (props.containsKey(WRITE_SCHEMA)) {
+      return props.getProperty(WRITE_SCHEMA);
+    }
     return props.getProperty(AVRO_SCHEMA);
   }
 

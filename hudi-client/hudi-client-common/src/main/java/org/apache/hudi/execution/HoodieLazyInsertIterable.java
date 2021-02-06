@@ -18,6 +18,7 @@
 
 package org.apache.hudi.execution;
 
+import java.util.Properties;
 import org.apache.hudi.client.WriteStatus;
 import org.apache.hudi.client.utils.LazyIterableIterator;
 import org.apache.hudi.common.engine.TaskContextSupplier;
@@ -82,10 +83,10 @@ public abstract class HoodieLazyInsertIterable<T extends HoodieRecordPayload>
     // It caches the exception seen while fetching insert value.
     public Option<Exception> exception = Option.empty();
 
-    public HoodieInsertValueGenResult(T record, Schema schema) {
+    public HoodieInsertValueGenResult(T record, Schema schema, Properties properties) {
       this.record = record;
       try {
-        this.insertValue = record.getData().getInsertValue(schema);
+        this.insertValue = record.getData().getInsertValue(schema, properties);
       } catch (Exception e) {
         this.exception = Option.of(e);
       }
@@ -97,8 +98,13 @@ public abstract class HoodieLazyInsertIterable<T extends HoodieRecordPayload>
    * expensive operations of transformation to the reader thread.
    */
   static <T extends HoodieRecordPayload> Function<HoodieRecord<T>, HoodieInsertValueGenResult<HoodieRecord>> getTransformFunction(
+      Schema schema, HoodieWriteConfig config) {
+    return hoodieRecord -> new HoodieInsertValueGenResult(hoodieRecord, schema, config.getProps());
+  }
+
+  static <T extends HoodieRecordPayload> Function<HoodieRecord<T>, HoodieInsertValueGenResult<HoodieRecord>> getTransformFunction(
       Schema schema) {
-    return hoodieRecord -> new HoodieInsertValueGenResult(hoodieRecord, schema);
+    return hoodieRecord -> new HoodieInsertValueGenResult(hoodieRecord, schema, new Properties());
   }
 
   @Override
