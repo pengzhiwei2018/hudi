@@ -46,13 +46,13 @@ import scala.collection.JavaConverters._
   *
   * @param _sqlContext Spark SQL Context
   * @param userSchema User specified schema in the datasource query
-  * @param globPaths Globbed paths obtained from the user provided path for querying
+  * @param tablePath  The table base path.
   * @param metaClient Hoodie table meta client
   * @param optParams DataSource options passed by the user
   */
 class HoodieBootstrapRelation(@transient val _sqlContext: SQLContext,
                               val userSchema: StructType,
-                              val globPaths: Seq[Path],
+                              val tablePath: String,
                               val metaClient: HoodieTableMetaClient,
                               val optParams: Map[String, String]) extends BaseRelation
   with PrunedFilteredScan with Logging {
@@ -156,8 +156,15 @@ class HoodieBootstrapRelation(@transient val _sqlContext: SQLContext,
 
   def buildFileIndex(): HoodieBootstrapFileIndex = {
     logInfo("Building file index..")
-    val inMemoryFileIndex = HoodieSparkUtils.createInMemoryFileIndex(_sqlContext.sparkSession, globPaths)
-    val fileStatuses = inMemoryFileIndex.allFiles()
+    val readPaths = optParams.get(DataSourceReadOptions.READ_PATHS_OPT_KEY)
+      .map(_.split(",")).getOrElse(Array.empty[String])
+
+    val fileStatuses  = if (readPaths.nonEmpty) { // Load the files from the specified read paths.
+      val globPaths = HoodieSparkUtils.checkAndGlobPathIfNecessary(readPaths, metaClient.getFs)
+      HoodieSparkUtils.createInMemoryFileIndex(_sqlContext.sparkSession, globPaths).allFiles()
+    } else {
+      HoodieFileIndex(sqlContext.sparkSession, tablePath, Some(schema), optParams).allFiles
+    }
 
     if (fileStatuses.isEmpty) {
       throw new HoodieException("No files found for reading in user provided path.")

@@ -19,6 +19,9 @@ package org.apache.hudi.functional
 
 import java.sql.{Date, Timestamp}
 
+import scala.collection.JavaConversions._
+import scala.collection.JavaConverters._
+
 import org.apache.hudi.common.config.HoodieMetadataConfig
 import org.apache.hudi.common.table.HoodieTableMetaClient
 import org.apache.hudi.common.table.timeline.HoodieInstant
@@ -39,7 +42,6 @@ import org.junit.jupiter.api.{AfterEach, BeforeEach, Test}
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
 
-import scala.collection.JavaConversions._
 
 /**
  * Basic tests on the spark datasource for COW table.
@@ -582,5 +584,51 @@ class TestCOWDataSource extends HoodieClientTestBase {
     recordsReadDF = spark.read.format("org.apache.hudi")
       .load(basePath + "/*")
     assertTrue(recordsReadDF.filter(col("_hoodie_partition_path") =!= lit("")).count() == 0)
+  }
+
+  @Test def testQueryWithoutStar(): Unit = {
+    val N = 20
+    // Test query with partition prune if URL_ENCODE_PARTITIONING_OPT_KEY has enable
+    val records1 = dataGen.generateInsertsContainsAllPartitions("000", N)
+    val inputDF1 = spark.read.json(spark.sparkContext.parallelize(recordsToStrings(records1), 2))
+    inputDF1.write.format("hudi")
+      .options(commonOpts)
+      .option(DataSourceWriteOptions.OPERATION_OPT_KEY, DataSourceWriteOptions.INSERT_OPERATION_OPT_VAL)
+      .option(DataSourceWriteOptions.URL_ENCODE_PARTITIONING_OPT_KEY, "true")
+      .mode(SaveMode.Overwrite)
+      .save(basePath)
+
+    val countIn20160315 = records1.asScala.count(record => record.getPartitionPath == "2016/03/15")
+    // query the partition by filter
+    val count1 = spark.read.format("hudi")
+      .load(basePath)
+      .filter("partition = '2016/03/15'")
+      .count()
+    assertEquals(countIn20160315, count1)
+
+    // query the partition by path
+    val count2 = spark.read.format("hudi")
+      .load(basePath + "/2016%2F03%2F15")
+      .count()
+    assertEquals(countIn20160315, count2)
+
+    // Test query without partition prune if URL_ENCODE_PARTITIONING_OPT_KEY has disable
+    val inputDF2 = spark.read.json(spark.sparkContext.parallelize(recordsToStrings(records1), 2))
+    inputDF2.write.format("hudi")
+      .options(commonOpts)
+      .option(DataSourceWriteOptions.OPERATION_OPT_KEY, DataSourceWriteOptions.INSERT_OPERATION_OPT_VAL)
+      .option(DataSourceWriteOptions.URL_ENCODE_PARTITIONING_OPT_KEY, "false")
+      .mode(SaveMode.Overwrite)
+      .save(basePath)
+    val count3 = spark.read.format("hudi")
+      .load(basePath)
+      .filter("partition = '2016/03/15'")
+      .count()
+    assertEquals(countIn20160315, count3)
+
+    val count4= spark.read.format("hudi")
+      .load(basePath + "/2016/03/15")
+      .count()
+    assertEquals(countIn20160315, count4)
   }
 }

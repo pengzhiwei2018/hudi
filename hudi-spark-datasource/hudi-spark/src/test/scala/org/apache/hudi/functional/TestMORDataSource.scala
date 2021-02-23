@@ -17,6 +17,8 @@
 
 package org.apache.hudi.functional
 
+import scala.collection.JavaConverters._
+
 import org.apache.hudi.DataSourceWriteOptions.{KEYGENERATOR_CLASS_OPT_KEY, PARTITIONPATH_FIELD_OPT_KEY, PAYLOAD_CLASS_OPT_KEY, PRECOMBINE_FIELD_OPT_KEY, RECORDKEY_FIELD_OPT_KEY}
 import org.apache.hudi.common.fs.FSUtils
 import org.apache.hudi.common.model.DefaultHoodieRecordPayload
@@ -561,5 +563,26 @@ class TestMORDataSource extends HoodieClientTestBase {
   def verifyShow(df: DataFrame): Unit = {
     df.show(1)
     df.select("_hoodie_commit_seqno", "fare.amount", "fare.currency", "tip_history").show(1)
+  }
+
+  @Test def testQueryWithoutStar(): Unit = {
+    val N = 20
+    // Test query with partition prune if URL_ENCODE_PARTITIONING_OPT_KEY has enable
+    val records1 = dataGen.generateInsertsContainsAllPartitions("000", N)
+    val inputDF1 = spark.read.json(spark.sparkContext.parallelize(recordsToStrings(records1), 2))
+    inputDF1.write.format("hudi")
+      .options(commonOpts)
+      .option(DataSourceWriteOptions.OPERATION_OPT_KEY, DataSourceWriteOptions.INSERT_OPERATION_OPT_VAL)
+      .option(DataSourceWriteOptions.URL_ENCODE_PARTITIONING_OPT_KEY, "true")
+      .option(DataSourceWriteOptions.TABLE_TYPE_OPT_KEY, DataSourceWriteOptions.MOR_TABLE_TYPE_OPT_VAL)
+      .mode(SaveMode.Overwrite)
+      .save(basePath)
+
+    val expectCount = records1.asScala.count(record => record.getPartitionPath == "2016/03/15")
+    val count1 = spark.read.format("hudi")
+      .load(basePath)
+      .filter("partition = '2016/03/15'")
+      .count()
+    assertEquals(expectCount, count1)
   }
 }

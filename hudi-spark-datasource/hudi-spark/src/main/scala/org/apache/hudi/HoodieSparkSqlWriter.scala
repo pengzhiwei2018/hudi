@@ -112,13 +112,34 @@ private[hudi] object HoodieSparkSqlWriter {
         val archiveLogFolder = parameters.getOrElse(
           HoodieTableConfig.HOODIE_ARCHIVELOG_FOLDER_PROP_NAME, "archived")
 
-        val tableMetaClient = HoodieTableMetaClient.withPropertyBuilder()
-          .setTableType(tableType)
-          .setTableName(tblName)
-          .setArchiveLogFolder(archiveLogFolder)
-          .setPayloadClassName(parameters(PAYLOAD_CLASS_OPT_KEY))
-          .setPreCombineField(parameters.getOrDefault(PRECOMBINE_FIELD_OPT_KEY, null))
-          .initTable(sparkContext.hadoopConfiguration, path.get)
+        val partitionColumns = parameters.getOrElse(DataSourceWriteOptions.PARTITIONPATH_FIELD_OPT_KEY, null)
+        val enablePartitionEncode = parameters.getOrElse(
+          DataSourceWriteOptions.URL_ENCODE_PARTITIONING_OPT_KEY, DataSourceWriteOptions
+            .DEFAULT_URL_ENCODE_PARTITIONING_OPT_VAL).toBoolean
+
+        // Store the partition columns for the spark sql to read partition schemas in
+        // HoodieFileIndex. Only store the partition columns when the partition path encoding
+        // has enabled as the spark partition schema must do the encoding for the partition value
+        // to ensure that one partition field must mapping only one partition value. (e.g. the
+        // "2021/03/08" will split to 3 partition values without the encoding)
+        val tableMetaClient = if (enablePartitionEncode) {
+          HoodieTableMetaClient.withPropertyBuilder()
+            .setTableType(tableType)
+            .setTableName(tblName)
+            .setArchiveLogFolder(archiveLogFolder)
+            .setPayloadClassName(parameters(PAYLOAD_CLASS_OPT_KEY))
+            .setPreCombineField(parameters.getOrDefault(PRECOMBINE_FIELD_OPT_KEY, null))
+            .setPartitionColumns(partitionColumns)
+            .initTable(sparkContext.hadoopConfiguration, path.get)
+        } else {
+          HoodieTableMetaClient.withPropertyBuilder()
+            .setTableType(tableType)
+            .setTableName(tblName)
+            .setArchiveLogFolder(archiveLogFolder)
+            .setPayloadClassName(parameters(PAYLOAD_CLASS_OPT_KEY))
+            .setPreCombineField(parameters.getOrDefault(PRECOMBINE_FIELD_OPT_KEY, null))
+            .initTable(sparkContext.hadoopConfiguration, path.get)
+        }
         tableConfig = tableMetaClient.getTableConfig
       }
 
