@@ -61,7 +61,7 @@ import java.util.stream.IntStream;
  * that does not correspond to a hoodie table then they are passed in as is (as what FileInputFormat.listStatus()
  * would do). The JobConf could have paths from multipe Hoodie/Non-Hoodie tables
  */
-@UseRecordReaderFromInputFormat
+//@UseRecordReaderFromInputFormat
 @UseFileSplitsFromInputFormat
 public class HoodieParquetInputFormat extends MapredParquetInputFormat implements Configurable {
 
