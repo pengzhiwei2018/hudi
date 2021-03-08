@@ -189,7 +189,8 @@ public class HoodieAppendHandle<T extends HoodieRecordPayload, I, K, O> extends 
   private Option<IndexedRecord> getIndexedRecord(HoodieRecord<T> hoodieRecord) {
     Option<Map<String, String>> recordMetadata = hoodieRecord.getData().getMetadata();
     try {
-      Option<IndexedRecord> avroRecord = hoodieRecord.getData().getInsertValue(writerSchema);
+      Option<IndexedRecord> avroRecord = hoodieRecord.getData().getInsertValue(inputSchema,
+          config.getProps());
       if (avroRecord.isPresent()) {
         // Convert GenericRecord to GenericRecord with hoodie commit metadata in schema
         avroRecord = Option.of(rewriteRecord((GenericRecord) avroRecord.get()));

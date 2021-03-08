@@ -30,7 +30,6 @@ import org.apache.hudi.common.model.HoodieWriteStat;
 import org.apache.hudi.common.model.HoodieWriteStat.RuntimeStats;
 import org.apache.hudi.common.model.IOType;
 import org.apache.hudi.common.util.Option;
-import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.exception.HoodieInsertException;
 import org.apache.hudi.io.storage.HoodieFileWriter;
@@ -63,14 +62,14 @@ public class HoodieCreateHandle<T extends HoodieRecordPayload, I, K, O> extends 
 
   public HoodieCreateHandle(HoodieWriteConfig config, String instantTime, HoodieTable<T, I, K, O> hoodieTable,
                             String partitionPath, String fileId, TaskContextSupplier taskContextSupplier) {
-    this(config, instantTime, hoodieTable, partitionPath, fileId, getWriterSchemaIncludingAndExcludingMetadataPair(config),
+    this(config, instantTime, hoodieTable, partitionPath, fileId, Option.empty(),
         taskContextSupplier);
   }
 
   public HoodieCreateHandle(HoodieWriteConfig config, String instantTime, HoodieTable<T, I, K, O> hoodieTable,
-                            String partitionPath, String fileId, Pair<Schema, Schema> writerSchemaIncludingAndExcludingMetadataPair,
+                            String partitionPath, String fileId, Option<Schema> specifySchema,
                             TaskContextSupplier taskContextSupplier) {
-    super(config, instantTime, partitionPath, fileId, hoodieTable, writerSchemaIncludingAndExcludingMetadataPair,
+    super(config, instantTime, partitionPath, fileId, hoodieTable, specifySchema,
         taskContextSupplier);
     writeStatus.setFileId(fileId);
     writeStatus.setPartitionPath(partitionPath);
@@ -113,6 +112,9 @@ public class HoodieCreateHandle<T extends HoodieRecordPayload, I, K, O> extends 
     Option recordMetadata = record.getData().getMetadata();
     try {
       if (avroRecord.isPresent()) {
+        if (avroRecord.get() == HoodieMergeHandle.IGNORE_RECORD) {
+          return;
+        }
         // Convert GenericRecord to GenericRecord with hoodie commit metadata in schema
         IndexedRecord recordWithMetadataInSchema = rewriteRecord((GenericRecord) avroRecord.get());
         fileWriter.writeAvroWithMetadata(recordWithMetadataInSchema, record);
@@ -154,9 +156,9 @@ public class HoodieCreateHandle<T extends HoodieRecordPayload, I, K, O> extends 
         final String key = keyIterator.next();
         HoodieRecord<T> record = recordMap.get(key);
         if (useWriterSchema) {
-          write(record, record.getData().getInsertValue(writerSchemaWithMetafields));
+          write(record, record.getData().getInsertValue(inputSchemaWithMetaFields, config.getProps()));
         } else {
-          write(record, record.getData().getInsertValue(writerSchema));
+          write(record, record.getData().getInsertValue(inputSchema, config.getProps()));
         }
       }
     } catch (IOException io) {

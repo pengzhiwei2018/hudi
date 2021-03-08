@@ -50,7 +50,7 @@ import org.apache.spark.sql.{DataFrame, SQLContext, SaveMode}
 import scala.collection.JavaConversions._
 import scala.collection.mutable.ListBuffer
 
-private[hudi] object HoodieSparkSqlWriter {
+object HoodieSparkSqlWriter {
 
   private val log = LogManager.getLogger(getClass)
   private var tableExists: Boolean = false
