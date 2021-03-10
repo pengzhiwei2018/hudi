@@ -586,7 +586,7 @@ class TestCOWDataSource extends HoodieClientTestBase {
     assertTrue(recordsReadDF.filter(col("_hoodie_partition_path") =!= lit("")).count() == 0)
   }
 
-  @Test def testQueryWithoutStar(): Unit = {
+  @Test def testQueryCowWithoutStar(): Unit = {
     val N = 20
     // Test query with partition prune if URL_ENCODE_PARTITIONING_OPT_KEY has enable
     val records1 = dataGen.generateInsertsContainsAllPartitions("000", N)
@@ -597,6 +597,7 @@ class TestCOWDataSource extends HoodieClientTestBase {
       .option(DataSourceWriteOptions.URL_ENCODE_PARTITIONING_OPT_KEY, "true")
       .mode(SaveMode.Overwrite)
       .save(basePath)
+    val commitInstantTime1 = HoodieDataSourceHelpers.latestCommit(fs, basePath)
 
     val countIn20160315 = records1.asScala.count(record => record.getPartitionPath == "2016/03/15")
     // query the partition by filter
@@ -612,9 +613,26 @@ class TestCOWDataSource extends HoodieClientTestBase {
       .count()
     assertEquals(countIn20160315, count2)
 
-    // Test query without partition prune if URL_ENCODE_PARTITIONING_OPT_KEY has disable
-    val inputDF2 = spark.read.json(spark.sparkContext.parallelize(recordsToStrings(records1), 2))
+    // Second write with Append mode
+    val records2 = dataGen.generateInsertsContainsAllPartitions("000", N + 1)
+    val inputDF2 = spark.read.json(spark.sparkContext.parallelize(recordsToStrings(records2), 2))
     inputDF2.write.format("hudi")
+      .options(commonOpts)
+      .option(DataSourceWriteOptions.OPERATION_OPT_KEY, DataSourceWriteOptions.INSERT_OPERATION_OPT_VAL)
+      .option(DataSourceWriteOptions.URL_ENCODE_PARTITIONING_OPT_KEY, "true")
+      .mode(SaveMode.Append)
+      .save(basePath)
+    // Incremental query without "*" in path
+    val hoodieIncViewDF1 = spark.read.format("org.apache.hudi")
+      .option(DataSourceReadOptions.QUERY_TYPE_OPT_KEY, DataSourceReadOptions.QUERY_TYPE_INCREMENTAL_OPT_VAL)
+      .option(DataSourceReadOptions.BEGIN_INSTANTTIME_OPT_KEY, commitInstantTime1)
+      .load(basePath)
+    assertEquals(N + 1, hoodieIncViewDF1.count())
+
+
+    // Test query without partition prune if URL_ENCODE_PARTITIONING_OPT_KEY has disable
+    val inputDF3 = spark.read.json(spark.sparkContext.parallelize(recordsToStrings(records1), 2))
+    inputDF3.write.format("hudi")
       .options(commonOpts)
       .option(DataSourceWriteOptions.OPERATION_OPT_KEY, DataSourceWriteOptions.INSERT_OPERATION_OPT_VAL)
       .option(DataSourceWriteOptions.URL_ENCODE_PARTITIONING_OPT_KEY, "false")

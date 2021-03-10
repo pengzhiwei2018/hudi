@@ -55,6 +55,7 @@ class MergeOnReadSnapshotRelation(val sqlContext: SQLContext,
                                   val optParams: Map[String, String],
                                   val userSchema: StructType,
                                   val tablePath: String,
+                                  val globPaths: Option[Seq[Path]],
                                   val metaClient: HoodieTableMetaClient)
   extends BaseRelation with PrunedFilteredScan with Logging {
 
@@ -133,9 +134,16 @@ class MergeOnReadSnapshotRelation(val sqlContext: SQLContext,
   }
 
   def buildFileIndex(): List[HoodieMergeOnReadFileSplit] = {
-    val hoodieFileIndex = HoodieFileIndex(sqlContext.sparkSession, tablePath,
-      Some(tableStructSchema), optParams)
-    val fileStatuses = hoodieFileIndex.allFiles
+    val fileStatuses = if (globPaths.isDefined) {
+      // Load files from the global paths if it has defined to be compatible with the original mode
+      val inMemoryFileIndex = HoodieSparkUtils.createInMemoryFileIndex(sqlContext.sparkSession, globPaths.get)
+      inMemoryFileIndex.allFiles()
+    } else { // Load files by the HoodieFileIndex.
+      val hoodieFileIndex = HoodieFileIndex(sqlContext.sparkSession, tablePath,
+        Some(tableStructSchema), optParams)
+      hoodieFileIndex.allFiles
+    }
+
     if (fileStatuses.isEmpty) { // If this an empty table, return an empty split list.
       List.empty[HoodieMergeOnReadFileSplit]
     } else {

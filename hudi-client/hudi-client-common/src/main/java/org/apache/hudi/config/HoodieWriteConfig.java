@@ -166,6 +166,9 @@ public class HoodieWriteConfig extends DefaultHoodieConfig {
   public static final String EXTERNAL_RECORD_AND_SCHEMA_TRANSFORMATION = AVRO_SCHEMA + ".externalTransformation";
   public static final String DEFAULT_EXTERNAL_RECORD_AND_SCHEMA_TRANSFORMATION = "false";
 
+  public static final String  MAX_LISTING_PARALLELISM = "hoodie.max.list.file.parallelism";
+  public static final Integer DEFAULT_MAX_LISTING_PARALLELISM = 200;
+
   private ConsistencyGuardConfig consistencyGuardConfig;
 
   // Hoodie Write Client transparently rewrites File System View config when embedded mode is enabled

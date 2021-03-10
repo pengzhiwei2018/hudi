@@ -17,12 +17,18 @@
 
 package org.apache.hudi
 
+import java.util.Properties
+
 import scala.collection.JavaConverters._
-import org.apache.hadoop.fs.{FileStatus, FileSystem, Path}
+import org.apache.hadoop.fs.{FileStatus, Path}
+import org.apache.hudi.client.common.HoodieSparkEngineContext
+import org.apache.hudi.common.config.{HoodieMetadataConfig, SerializableConfiguration}
 import org.apache.hudi.common.fs.FSUtils
 import org.apache.hudi.common.model.HoodieBaseFile
 import org.apache.hudi.common.table.{HoodieTableMetaClient, TableSchemaResolver}
 import org.apache.hudi.common.table.view.HoodieTableFileSystemView
+import org.apache.hudi.config.HoodieWriteConfig
+import org.apache.spark.api.java.JavaSparkContext
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.{InternalRow, expressions}
 import org.apache.spark.sql.SparkSession
@@ -32,9 +38,6 @@ import org.apache.spark.sql.catalyst.util.{CaseInsensitiveMap, DateTimeUtils}
 import org.apache.spark.sql.execution.datasources.{FileIndex, PartitionDirectory, PartitionUtils}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.StructType
-
-import scala.collection.mutable
-import scala.collection.mutable.ListBuffer
 
 /**
   * A File Index which support partition prune for hoodie snapshot and read-optimized
@@ -55,12 +58,11 @@ case class HoodieFileIndex(
      options: Map[String, String])
   extends FileIndex with Logging {
 
-  private val hadoopConf = spark.sessionState.newHadoopConf()
-  private val fs = new Path(basePath).getFileSystem(hadoopConf)
+  @transient private val hadoopConf = spark.sessionState.newHadoopConf()
   private lazy val metaClient = HoodieTableMetaClient
     .builder().setConf(hadoopConf).setBasePath(basePath).build()
 
-  private val queryPath = new Path(options.getOrElse("path", "'path' option required"))
+  @transient private val queryPath = new Path(options.getOrElse("path", "'path' option required"))
   /**
     * Get the schema of the table.
     */
@@ -90,14 +92,10 @@ case class HoodieFileIndex(
     }
   }
 
-  private val timeZoneId = CaseInsensitiveMap(options)
-    .get(DateTimeUtils.TIMEZONE_OPTION)
-    .getOrElse(SQLConf.get.sessionLocalTimeZone)
-
-  @volatile private var fileSystemView: HoodieTableFileSystemView = _
-  @volatile private var cachedAllInputFiles: Array[HoodieBaseFile] = _
-  @volatile private var cachedFileSize: Long = 0L
-  @volatile private var cachedAllPartitionPaths: Seq[PartitionPath] = _
+  @transient @volatile private var fileSystemView: HoodieTableFileSystemView = _
+  @transient @volatile private var cachedAllInputFiles: Array[HoodieBaseFile] = _
+  @transient @volatile private var cachedFileSize: Long = 0L
+  @transient @volatile private var cachedAllPartitionPaths: Seq[PartitionPath] = _
 
   refresh()
 
@@ -106,7 +104,6 @@ case class HoodieFileIndex(
   override def listFiles(partitionFilters: Seq[Expression],
                          dataFilters: Seq[Expression]): Seq[PartitionDirectory] = {
     if (partitionSchema.fields.isEmpty) { // None partition table.
-      val allFiles = cachedAllInputFiles.map(_.getFileStatus)
       Seq(PartitionDirectory(InternalRow.empty, allFiles))
     } else {
       // Prune the partition path by the partition filters
@@ -126,9 +123,9 @@ case class HoodieFileIndex(
 
   override def refresh(): Unit = {
     val startTime = System.currentTimeMillis()
-    val partitionFiles = loadPartitionPathFiles(queryPath, fs)
-    val allFiles = if (partitionFiles.isEmpty) Array.empty[FileStatus]
-    else partitionFiles.values.reduce(_ ++ _).toArray
+    val partitionFiles = loadPartitionPathFiles()
+    val allFiles = partitionFiles.values.reduceOption(_ ++ _)
+      .getOrElse(Array.empty[FileStatus])
 
     metaClient.reloadActiveTimeline()
     val activeInstants = metaClient.getActiveTimeline.getCommitsTimeline.filterCompletedInstants
@@ -175,90 +172,86 @@ case class HoodieFileIndex(
           BoundReference(index, partitionSchema(index).dataType, nullable = true)
       })
 
-      val selected = partitionPaths.filter {
+      val partitionPruned = partitionPaths.filter {
         case PartitionPath(values, _) => boundPredicate.eval(values)
       }
-      logInfo {
-        val total = partitionPaths.length
-        val selectedSize = selected.length
-        val percentPruned = (1 - selectedSize.toDouble / total.toDouble) * 100
-        s"Selected $selectedSize partitions out of $total, " +
-          s"pruned ${if (total == 0) "0" else s"$percentPruned%"} partitions."
-      }
-      selected
+      logInfo(s"Total partition size is: ${partitionPaths.size}," +
+        s" after partition prune size is: ${partitionPruned.size}")
+      partitionPruned
     } else {
       partitionPaths
     }
   }
 
   /**
-    * Load all partition paths and it's files under the specify directory.
-    * @param dir The specify directory to load.
-    * @param fs  FileSystem
-    * @return A Map of PartitionPath and files in the PartitionPath under the "dir" directory.
+    * Load all partition paths and it's files under the query table path.
     */
-  private def loadPartitionPathFiles(dir: Path, fs: FileSystem): Map[PartitionPath, Seq[FileStatus]] = {
-    val subFiles = fs.listStatus(dir).filterNot(_.getPath.getName.startsWith("."))
-    if (subFiles.isEmpty) {
-      Map.empty
-    } else {
-      val (dirs, files) = subFiles.partition(_.isDirectory)
-      val partitionFiles = mutable.Map[PartitionPath, ListBuffer[FileStatus]]()
-      if (files.nonEmpty) {
-        files.foreach { file =>
-          val partitionPathString = FSUtils.getRelativePartitionPath(new Path(basePath),
-            file.getPath.getParent)
+  private def loadPartitionPathFiles(): Map[PartitionPath, Array[FileStatus]] = {
+    val sparkEngine = new HoodieSparkEngineContext(new JavaSparkContext(spark.sparkContext))
+    val properties = new Properties()
+    properties.putAll(options.asJava)
+    val metadataConfig = HoodieMetadataConfig.newBuilder.fromProperties(properties).build()
 
-          val partitionValues = if (_partitionSchema.fields.isEmpty) { // None partitioned table
-            InternalRow.empty
+    val queryPartitionPath = FSUtils.getRelativePartitionPath(new Path(basePath), queryPath)
+    // Load all the partition path from the basePath, and filter by the query partition path.
+    val partitionPaths = FSUtils.getAllPartitionPaths(sparkEngine, metadataConfig, basePath).asScala
+      .filter(_.startsWith(queryPartitionPath))
+
+    val maxListParallelism = options.get(HoodieWriteConfig.MAX_LISTING_PARALLELISM)
+      .map(_.toInt).getOrElse(HoodieWriteConfig.DEFAULT_MAX_LISTING_PARALLELISM.intValue())
+    val isPartitionedTable = _partitionSchema.fields.isEmpty
+    val serializableConf = new SerializableConfiguration(hadoopConf)
+    val partitionSchema = _partitionSchema
+    val timeZoneId = CaseInsensitiveMap(options)
+      .get(DateTimeUtils.TIMEZONE_OPTION)
+      .getOrElse(SQLConf.get.sessionLocalTimeZone)
+    // List files in all of the partition path.
+    val partition2Files =
+      spark.sparkContext.parallelize(partitionPaths, Math.min(partitionPaths.size, maxListParallelism))
+        .map { partitionPath =>
+          val partitionRow = if (isPartitionedTable) { // This is a none partitioned table
+            InternalRow.fromSeq(Seq(""))
           } else {
-            val partitionSeqs = partitionPathString.split("/")
-            assert(partitionSeqs.length == _partitionSchema.size,
+            val partitionSeqs = partitionPath.split("/")
+            assert(partitionSeqs.length == partitionSchema.size,
               s"size of partition values[size is: ${partitionSeqs.size}, path " +
-                s"is: '$partitionPathString'] is not equal to the size of" +
-                s" partition schema field[size is: ${_partitionSchema.size}," +
-                s" fields is: ${_partitionSchema.json}].")
+                s"is: '$partitionPath'] is not equal to the size of" +
+                s" partition schema field[size is: ${partitionSchema.size}," +
+                s" fields is: ${partitionSchema.json}].")
             // Append partition name to the partition value.
             // e.g. convert "/xx/xx/2021/02" to "/xx/xx/year=2021/month=02"
             val partitionWithName =
-              partitionSeqs.zip(_partitionSchema).map {
-                case (partition, field) =>
-                  if (partition.indexOf("=") == -1) {
-                    s"${field.name}=$partition"
-                  } else {
-                    partition
-                  }
-              }.mkString("/")
+            partitionSeqs.zip(partitionSchema).map {
+              case (partition, field) =>
+                if (partition.indexOf("=") == -1) {
+                  s"${field.name}=$partition"
+                } else {
+                  partition
+                }
+            }.mkString("/")
             val pathWithPartitionName = new Path(basePath, partitionWithName)
-            val partitionDataTypes = _partitionSchema.fields.map(f => f.name -> f.dataType).toMap
+            val partitionDataTypes = partitionSchema.fields.map(f => f.name -> f.dataType).toMap
             val partitionValues = PartitionUtils.parsePartition(pathWithPartitionName,
               typeInference = false, Set(new Path(basePath)), partitionDataTypes,
               DateTimeUtils.getTimeZone(timeZoneId))
+
             // Convert partitionValues to InternalRow
             partitionValues.map(_.literals.map(_.value))
               .map(InternalRow.fromSeq)
               .getOrElse(InternalRow.empty)
           }
-          val partitionPath = PartitionPath(partitionValues, partitionPathString)
-          if (!partitionFiles.contains(partitionPath)) {
-            partitionFiles.put(partitionPath, new ListBuffer[FileStatus])
+          val fullPartitionPath = if (partitionPath.isEmpty) {
+            new Path(basePath) // This is a none partition path
+          } else {
+            new Path(basePath, partitionPath)
           }
-          partitionFiles(partitionPath).append(file)
-        }
-      }
-      if (dirs.nonEmpty) {
-        dirs.map(s => loadPartitionPathFiles(s.getPath, fs))
-          .foreach(map => {
-            map.foreach { kv =>
-              if (!partitionFiles.contains(kv._1)) {
-                partitionFiles.put(kv._1, new ListBuffer[FileStatus])
-              }
-              partitionFiles(kv._1).appendAll(kv._2)
-            }
-          })
-      }
-      partitionFiles.toMap
-    }
+          val fs = fullPartitionPath.getFileSystem(serializableConf.get())
+          val filesInPartition = FSUtils.getAllDataFilesInPartition(fs, fullPartitionPath)
+
+          (PartitionPath(partitionRow, partitionPath), filesInPartition)
+        }.collect()
+    // Convert to Map[PartitionPath, Array[FileStatus]
+    partition2Files.map(f => f._1 -> f._2).toMap
   }
 
   /**

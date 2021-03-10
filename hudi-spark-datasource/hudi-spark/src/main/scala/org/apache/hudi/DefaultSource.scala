@@ -19,7 +19,7 @@ package org.apache.hudi
 
 import org.apache.hadoop.fs.Path
 import org.apache.hudi.DataSourceReadOptions._
-import org.apache.hudi.common.model.{HoodieRecord, HoodieTableType}
+import org.apache.hudi.common.model.HoodieRecord
 import org.apache.hudi.DataSourceWriteOptions.{BOOTSTRAP_OPERATION_OPT_VAL, OPERATION_OPT_KEY}
 import org.apache.hudi.common.fs.FSUtils
 import org.apache.hudi.common.model.HoodieTableType.{COPY_ON_WRITE, MERGE_ON_READ}
@@ -69,15 +69,10 @@ class DefaultSource extends RelationProvider
   override def createRelation(sqlContext: SQLContext,
                               optParams: Map[String, String],
                               schema: StructType): BaseRelation = {
-    // Remove the "*" from the path in order to be compatible with the previous query path with "*"
-    val path = removeStar(optParams.get("path"))
     // Add default options for unspecified read options keys.
-    val parameters = if (path.isDefined) {
-      translateViewTypesToQueryTypes(optParams) + ("path" -> path.get)
-    } else {
-      translateViewTypesToQueryTypes(optParams)
-    }
+    val parameters = translateViewTypesToQueryTypes(optParams)
 
+    val path = parameters.get("path")
     val readPathsStr = parameters.get(DataSourceReadOptions.READ_PATHS_OPT_KEY)
     if (path.isEmpty && readPathsStr.isEmpty) {
       throw new HoodieException(s"'path' or '$READ_PATHS_OPT_KEY' or both must be specified.")
@@ -87,13 +82,27 @@ class DefaultSource extends RelationProvider
     val allPaths = path.map(p => Seq(p)).getOrElse(Seq()) ++ readPaths
 
     val fs = FSUtils.getFs(allPaths.head, sqlContext.sparkContext.hadoopConfiguration)
-    // Get the table base path
-    val tablePathOpt = TablePathUtils.getTablePath(fs, new Path(allPaths.head))
-    val tablePath = if (tablePathOpt.isPresent) {
-      tablePathOpt.get().toString
+    // Use the HoodieFileIndex only if the 'path' has specified with no "*" contains.
+    // And READ_PATHS_OPT_KEY has not specified.
+    // Or else we use the original way to read hoodie table.
+    val useHoodieFileIndex = path.isDefined && !path.get.contains("*") &&
+      !parameters.contains(DataSourceReadOptions.READ_PATHS_OPT_KEY)
+    val globPaths = if (useHoodieFileIndex) {
+      None
     } else {
-      throw new HoodieException(s"Failed to get the table path, " +
-        s"Maybe ${allPaths.head} is not a hoodie table path")
+      Some(HoodieSparkUtils.checkAndGlobPathIfNecessary(allPaths, fs))
+    }
+    // Get the table base path
+    val tablePath = if (globPaths.isDefined) {
+      DataSourceUtils.getTablePath(fs, globPaths.get.toArray)
+    } else {
+      val tablePathOpt = TablePathUtils.getTablePath(fs, new Path(path.get))
+      if (tablePathOpt.isPresent) {
+        tablePathOpt.get().toString
+      } else {
+        throw new HoodieException(s"Failed to get the table path, " +
+          s"Maybe ${allPaths.head} is not a hudi table path")
+      }
     }
     log.info("Obtained hudi table path: " + tablePath)
 
@@ -104,48 +113,28 @@ class DefaultSource extends RelationProvider
     log.info(s"Is bootstrapped table => $isBootstrappedTable, tableType is: $tableType")
 
     (tableType, queryType, isBootstrappedTable) match {
-
       case (COPY_ON_WRITE, QUERY_TYPE_SNAPSHOT_OPT_VAL, false) |
            (COPY_ON_WRITE, QUERY_TYPE_READ_OPTIMIZED_OPT_VAL, false) |
            (MERGE_ON_READ, QUERY_TYPE_READ_OPTIMIZED_OPT_VAL, false) =>
-        getBaseFileOnlyView(sqlContext, parameters, schema, tablePath, metaClient)
+        getBaseFileOnlyView(useHoodieFileIndex, sqlContext, parameters, schema, tablePath,
+          readPaths, metaClient)
 
       case (COPY_ON_WRITE, QUERY_TYPE_INCREMENTAL_OPT_VAL, _) =>
         new IncrementalRelation(sqlContext, parameters, schema, metaClient)
 
       case (MERGE_ON_READ, QUERY_TYPE_SNAPSHOT_OPT_VAL, false) =>
-        new MergeOnReadSnapshotRelation(sqlContext, parameters, schema, tablePath, metaClient)
+        new MergeOnReadSnapshotRelation(sqlContext, parameters, schema, tablePath, globPaths, metaClient)
 
       case (MERGE_ON_READ, QUERY_TYPE_INCREMENTAL_OPT_VAL, _) =>
         new MergeOnReadIncrementalRelation(sqlContext, parameters, schema, metaClient)
 
       case (_, _, true) =>
-        new HoodieBootstrapRelation(sqlContext, schema, tablePath, metaClient, parameters)
+        new HoodieBootstrapRelation(sqlContext, schema, tablePath, globPaths, metaClient, parameters)
 
       case (_, _, _) =>
         throw new HoodieException(s"Invalid query type : $queryType for tableType: $tableType," +
           s"isBootstrappedTable: $isBootstrappedTable ")
     }
-  }
-
-  /**
-    * Remove the stars from the path in order to be compatible with the
-    * previous query path with "*".
-    * @param pathOpt
-    * @return
-    */
-  private def removeStar(pathOpt: Option[String]): Option[String] = {
-    pathOpt map (path => {
-      if (path == null) {
-        null
-      } else {
-        var newPath = path.stripSuffix("/").stripSuffix("/*.parquet")
-        while (newPath.endsWith("/*")) {
-          newPath = newPath.substring(0, newPath.length - 2)
-        }
-        newPath
-      }
-    })
   }
 
   /**
@@ -195,23 +184,44 @@ class DefaultSource extends RelationProvider
 
   override def shortName(): String = "hudi"
 
-  private def getBaseFileOnlyView(sqlContext: SQLContext,
+  private def getBaseFileOnlyView(useHoodieFileIndex: Boolean,
+                                  sqlContext: SQLContext,
                                   optParams: Map[String, String],
                                   schema: StructType,
                                   tablePath: String,
+                                  extraReadPaths: Seq[String],
                                   metaClient: HoodieTableMetaClient): BaseRelation = {
     log.warn("Loading Base File Only View.")
-    val fileIndex = HoodieFileIndex(sqlContext.sparkSession, tablePath,
-      if (schema == null) Option.empty[StructType] else Some(schema), optParams)
+    if (useHoodieFileIndex) {
+      val fileIndex = HoodieFileIndex(sqlContext.sparkSession, tablePath,
+        if (schema == null) Option.empty[StructType] else Some(schema), optParams)
 
-    log.info("Constructing hoodie (as parquet) data source with options :" + optParams)
-    HadoopFsRelation(
-      fileIndex,
-      fileIndex.partitionSchema,
-      fileIndex.dataSchema,
-      bucketSpec = None,
-      fileFormat = new ParquetFileFormat,
-      optParams)(sqlContext.sparkSession)
+      log.info("Constructing hoodie (as parquet) data source with options :" + optParams)
+      HadoopFsRelation(
+        fileIndex,
+        fileIndex.partitionSchema,
+        fileIndex.dataSchema,
+        bucketSpec = None,
+        fileFormat = new ParquetFileFormat,
+        optParams)(sqlContext.sparkSession)
+    } else {
+      // this is just effectively RO view only, where `path` can contain a mix of
+      // non-hoodie/hoodie path files. set the path filter up
+      sqlContext.sparkContext.hadoopConfiguration.setClass(
+        "mapreduce.input.pathFilter.class",
+        classOf[HoodieROTablePathFilter],
+        classOf[org.apache.hadoop.fs.PathFilter])
+
+      log.info("Constructing hoodie (as parquet) data source with options :" + optParams)
+      // simply return as a regular parquet relation
+      DataSource.apply(
+        sparkSession = sqlContext.sparkSession,
+        paths = extraReadPaths,
+        userSpecifiedSchema = Option(schema),
+        className = "parquet",
+        options = optParams)
+        .resolveRelation()
+    }
   }
 
   override def sourceSchema(sqlContext: SQLContext,

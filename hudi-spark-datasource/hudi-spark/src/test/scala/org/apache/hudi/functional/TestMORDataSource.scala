@@ -565,7 +565,7 @@ class TestMORDataSource extends HoodieClientTestBase {
     df.select("_hoodie_commit_seqno", "fare.amount", "fare.currency", "tip_history").show(1)
   }
 
-  @Test def testQueryWithoutStar(): Unit = {
+  @Test def testQueryMorWithoutStar(): Unit = {
     val N = 20
     // Test query with partition prune if URL_ENCODE_PARTITIONING_OPT_KEY has enable
     val records1 = dataGen.generateInsertsContainsAllPartitions("000", N)

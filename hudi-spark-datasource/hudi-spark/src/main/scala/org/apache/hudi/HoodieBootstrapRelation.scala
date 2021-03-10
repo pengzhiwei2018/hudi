@@ -47,12 +47,15 @@ import scala.collection.JavaConverters._
   * @param _sqlContext Spark SQL Context
   * @param userSchema User specified schema in the datasource query
   * @param tablePath  The table base path.
+  * @param globPaths  The global paths to query. If it not none, read from the globPaths,
+  *                   else read data from tablePath using HoodiFileIndex.
   * @param metaClient Hoodie table meta client
   * @param optParams DataSource options passed by the user
   */
 class HoodieBootstrapRelation(@transient val _sqlContext: SQLContext,
                               val userSchema: StructType,
                               val tablePath: String,
+                              val globPaths: Option[Seq[Path]],
                               val metaClient: HoodieTableMetaClient,
                               val optParams: Map[String, String]) extends BaseRelation
   with PrunedFilteredScan with Logging {
@@ -156,16 +159,13 @@ class HoodieBootstrapRelation(@transient val _sqlContext: SQLContext,
 
   def buildFileIndex(): HoodieBootstrapFileIndex = {
     logInfo("Building file index..")
-    val readPaths = optParams.get(DataSourceReadOptions.READ_PATHS_OPT_KEY)
-      .map(_.split(",")).getOrElse(Array.empty[String])
-
-    val fileStatuses  = if (readPaths.nonEmpty) { // Load the files from the specified read paths.
-      val globPaths = HoodieSparkUtils.checkAndGlobPathIfNecessary(readPaths, metaClient.getFs)
-      HoodieSparkUtils.createInMemoryFileIndex(_sqlContext.sparkSession, globPaths).allFiles()
-    } else {
-      HoodieFileIndex(sqlContext.sparkSession, tablePath, Some(schema), optParams).allFiles
+    val fileStatuses  = if (globPaths.isDefined) {
+      // Load files from the global paths if it has defined to be compatible with the original mode
+      val inMemoryFileIndex = HoodieSparkUtils.createInMemoryFileIndex(_sqlContext.sparkSession, globPaths.get)
+      inMemoryFileIndex.allFiles()
+    } else { // Load files by the HoodieFileIndex.
+        HoodieFileIndex(sqlContext.sparkSession, tablePath, Some(schema), optParams).allFiles
     }
-
     if (fileStatuses.isEmpty) {
       throw new HoodieException("No files found for reading in user provided path.")
     }

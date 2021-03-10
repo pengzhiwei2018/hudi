@@ -131,6 +131,10 @@ class TestDataSourceForBootstrap {
     assertEquals(numRecords, hoodieROViewDF1.count())
     assertEquals(numRecordsUpdate, hoodieROViewDF1.filter(s"timestamp == $updateTimestamp").count())
 
+    val hoodieROViewDF1WithoutStar = spark.read.format("hudi").load(basePath)
+    assertEquals(numRecords, hoodieROViewDF1WithoutStar.count())
+    assertEquals(numRecordsUpdate, hoodieROViewDF1WithoutStar.filter(s"timestamp == $updateTimestamp").count())
+
     verifyIncrementalViewResult(commitInstantTime1, commitInstantTime2, isPartitioned = false, isHiveStylePartitioned = false)
   }
 
@@ -304,6 +308,13 @@ class TestDataSourceForBootstrap {
                             .load(basePath + "/*")
     assertEquals(numRecords, hoodieROViewDF2.count())
     assertEquals(numRecordsUpdate, hoodieROViewDF2.filter(s"timestamp == $updateTimestamp").count())
+    // Test query without "*" for MOR READ_OPTIMIZED
+    val hoodieROViewDFWithoutStar = spark.read.format("hudi")
+      .option(DataSourceReadOptions.QUERY_TYPE_OPT_KEY,
+        DataSourceReadOptions.QUERY_TYPE_READ_OPTIMIZED_OPT_VAL)
+      .load(basePath)
+    assertEquals(numRecords, hoodieROViewDFWithoutStar.count())
+    assertEquals(numRecordsUpdate, hoodieROViewDFWithoutStar.filter(s"timestamp == $updateTimestamp").count())
   }
 
   @Test def testMetadataBootstrapMORPartitioned(): Unit = {
@@ -333,6 +344,12 @@ class TestDataSourceForBootstrap {
                               DataSourceReadOptions.QUERY_TYPE_READ_OPTIMIZED_OPT_VAL)
                             .load(basePath + "/*")
     assertEquals(numRecords, hoodieROViewDF1.count())
+    // Read bootstrapped table without "*"
+    val hoodieROViewDFWithoutStar = spark.read.format("hudi")
+      .option(DataSourceReadOptions.QUERY_TYPE_OPT_KEY,
+        DataSourceReadOptions.QUERY_TYPE_READ_OPTIMIZED_OPT_VAL)
+      .load(basePath)
+    assertEquals(numRecords, hoodieROViewDFWithoutStar.count())
 
     // Perform upsert based on the written bootstrap table
     val updateDf1 = hoodieROViewDF1.filter(col("_row_key") === verificationRowKey).withColumn(verificationCol, lit(updatedVerificationVal))
@@ -419,6 +436,9 @@ class TestDataSourceForBootstrap {
     // Read bootstrapped table and verify count
     val hoodieROViewDF1 = spark.read.format("hudi").load(basePath + "/*")
     assertEquals(numRecords, hoodieROViewDF1.count())
+
+    val hoodieROViewDFWithoutStar = spark.read.format("hudi").load(basePath)
+    assertEquals(numRecords, hoodieROViewDFWithoutStar.count())
 
     // Perform upsert
     val updateTimestamp = Instant.now.toEpochMilli
