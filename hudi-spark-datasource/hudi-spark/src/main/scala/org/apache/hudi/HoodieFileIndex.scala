@@ -278,6 +278,8 @@ case class HoodieFileIndex(
                 .getOrElse(InternalRow.empty)
             }
           }
+
+          // Get files from the partition path.
           val fullPartitionPath = if (partitionPath.isEmpty) {
             new Path(basePath) // This is a none partition path
           } else {
