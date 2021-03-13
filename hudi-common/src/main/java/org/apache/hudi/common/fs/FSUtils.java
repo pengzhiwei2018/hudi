@@ -277,6 +277,13 @@ public class FSUtils {
     }
   }
 
+  public static FileStatus[] getFilesInPartition(HoodieEngineContext engineContext, HoodieMetadataConfig metadataConfig,
+                                                 String basePathStr, Path partitionPath) throws IOException {
+    HoodieTableMetadata tableMetadata = HoodieTableMetadata.create(engineContext, metadataConfig, basePathStr,
+        FileSystemViewStorageConfig.DEFAULT_VIEW_SPILLABLE_DIR);
+    return tableMetadata.getAllFilesInPartition(partitionPath);
+  }
+
   public static String getFileExtension(String fullName) {
     Objects.requireNonNull(fullName);
     String fileName = new File(fullName).getName();

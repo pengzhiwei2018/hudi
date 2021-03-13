@@ -631,6 +631,7 @@ class TestCOWDataSource extends HoodieClientTestBase {
 
 
     // Test query without partition prune if URL_ENCODE_PARTITIONING_OPT_KEY has disable
+    // We can still benefit from the partition prune.
     val inputDF3 = spark.read.json(spark.sparkContext.parallelize(recordsToStrings(records1), 2))
     inputDF3.write.format("hudi")
       .options(commonOpts)

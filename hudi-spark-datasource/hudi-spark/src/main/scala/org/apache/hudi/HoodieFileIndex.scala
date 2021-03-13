@@ -20,9 +20,11 @@ package org.apache.hudi
 import java.util.Properties
 
 import scala.collection.JavaConverters._
+
 import org.apache.hadoop.fs.{FileStatus, Path}
 import org.apache.hudi.client.common.HoodieSparkEngineContext
 import org.apache.hudi.common.config.{HoodieMetadataConfig, SerializableConfiguration}
+import org.apache.hudi.common.engine.HoodieLocalEngineContext
 import org.apache.hudi.common.fs.FSUtils
 import org.apache.hudi.common.model.HoodieBaseFile
 import org.apache.hudi.common.table.{HoodieTableMetaClient, TableSchemaResolver}
@@ -38,6 +40,7 @@ import org.apache.spark.sql.catalyst.util.{CaseInsensitiveMap, DateTimeUtils}
 import org.apache.spark.sql.execution.datasources.{FileIndex, PartitionDirectory, PartitionUtils}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.StructType
+import org.apache.spark.unsafe.types.UTF8String
 
 /**
   * A File Index which support partition prune for hoodie snapshot and read-optimized
@@ -46,10 +49,19 @@ import org.apache.spark.sql.types.StructType
   * 1、Load all files and partition values from the table path.
   * 2、Do the partition prune by the partition filter condition.
   *
-  * Note:
-  * Only when the URL_ENCODE_PARTITIONING_OPT_KEY is enable, we can store the partition columns
-  * to the hoodie.properties in HoodieSqlWriter when write table. So that the query can benefit
-  * from the partition prune.
+  * There are 3 cases for this:
+  * 1、If the partition columns size is equal to the actually partition path level, we
+  * read it as partitioned table.(e.g partition column is "dt", the partition path is "2021-03-10")
+  *
+  * 2、If the partition columns size is not equal to the partition path level, but the partition
+  * column size is "1" (e.g. partition column is "dt", but the partition path is "2021/03/10"
+  * who'es directory level is 3).We can still read it as a partitioned table. We will mapping the
+  * partition path (e.g. 2021/03/10) to the only partition column (e.g. "dt").
+  *
+  * 3、Else the the partition columns size is not equal to the partition directory level and the
+  * size is great than "1" (e.g. partition column is "dt,hh", the partition path is "2021/03/10/12")
+  * , we read it as a None Partitioned table because we cannot know how to mapping the partition
+  * path with the partition columns in this case.
   */
 case class HoodieFileIndex(
      spark: SparkSession,
@@ -73,21 +85,20 @@ case class HoodieFileIndex(
   })
 
   /**
-    * Get the partition schema.
+    * Get the partition schema from the hoodie.properties.
     */
-  private lazy val _partitionSchema: StructType = {
+  private lazy val _partitionSchemaFromProperties: StructType = {
     val tableConfig = metaClient.getTableConfig
     val partitionColumns = tableConfig.getPartitionColumns
     val nameFieldMap = schema.fields.map(filed => filed.name -> filed).toMap
-    // If the URL_ENCODE_PARTITIONING_OPT_KEY has enable, the partition schema will stored in
-    // hoodie.properties, So we can benefit from the partition prune.
+
     if (partitionColumns.isPresent) {
       val partitionFields = partitionColumns.get().map(column =>
         nameFieldMap.getOrElse(column, throw new IllegalArgumentException(s"Cannot find column " +
           s"$column in the schema[${schema.fields.mkString(",")}]")))
       new StructType(partitionFields)
-    } else { // If the URL_ENCODE_PARTITIONING_OPT_KEY is disable, we trait it as a
-      // none-partitioned table.
+    } else { // If the partition columns have not stored in hoodie.properites(the table that was
+      // created earlier), we trait it as a none-partitioned table.
       new StructType()
     }
   }
@@ -97,13 +108,15 @@ case class HoodieFileIndex(
   @transient @volatile private var cachedFileSize: Long = 0L
   @transient @volatile private var cachedAllPartitionPaths: Seq[PartitionPath] = _
 
+  @volatile private var queryAsNonePartitionedTable: Boolean = _
+
   refresh()
 
   override def rootPaths: Seq[Path] = queryPath :: Nil
 
   override def listFiles(partitionFilters: Seq[Expression],
                          dataFilters: Seq[Expression]): Seq[PartitionDirectory] = {
-    if (partitionSchema.fields.isEmpty) { // None partition table.
+    if (queryAsNonePartitionedTable) { // Read as None Partitioned table.
       Seq(PartitionDirectory(InternalRow.empty, allFiles))
     } else {
       // Prune the partition path by the partition filters
@@ -134,6 +147,9 @@ case class HoodieFileIndex(
     cachedAllPartitionPaths = partitionFiles.keys.toSeq
     cachedFileSize = cachedAllInputFiles.map(_.getFileLen).sum
 
+    // If the partition value contains InternalRow.empty, we query it as a none partitioned table.
+    queryAsNonePartitionedTable = cachedAllPartitionPaths
+      .exists(p => p.values == InternalRow.empty)
     val flushSpend = System.currentTimeMillis() - startTime
     logInfo(s"Refresh for table ${metaClient.getTableConfig.getTableName}," +
       s" spend: $flushSpend ms")
@@ -143,14 +159,22 @@ case class HoodieFileIndex(
     cachedFileSize
   }
 
-  override def partitionSchema: StructType = _partitionSchema
+  override def partitionSchema: StructType = {
+    if (queryAsNonePartitionedTable) {
+      // If we read it as None Partitioned table, we should not
+      // return the partition schema.
+      new StructType()
+    } else {
+      _partitionSchemaFromProperties
+    }
+  }
 
   /**
     * Get the data schema of the table.
     * @return
     */
   def dataSchema: StructType = {
-    val partitionColumns = _partitionSchema.fields.map(_.name).toSet
+    val partitionColumns = partitionSchema.fields.map(_.name).toSet
     StructType(schema.fields.filterNot(f => partitionColumns.contains(f.name)))
   }
 
@@ -199,54 +223,72 @@ case class HoodieFileIndex(
 
     val maxListParallelism = options.get(HoodieWriteConfig.MAX_LISTING_PARALLELISM)
       .map(_.toInt).getOrElse(HoodieWriteConfig.DEFAULT_MAX_LISTING_PARALLELISM.intValue())
-    val isPartitionedTable = _partitionSchema.fields.isEmpty
-    val serializableConf = new SerializableConfiguration(hadoopConf)
-    val partitionSchema = _partitionSchema
+    val serializableConf = new SerializableConfiguration(spark.sessionState.newHadoopConf())
+    val partitionSchema = _partitionSchemaFromProperties
     val timeZoneId = CaseInsensitiveMap(options)
       .get(DateTimeUtils.TIMEZONE_OPTION)
       .getOrElse(SQLConf.get.sessionLocalTimeZone)
+
     // List files in all of the partition path.
     val partition2Files =
       spark.sparkContext.parallelize(partitionPaths, Math.min(partitionPaths.size, maxListParallelism))
         .map { partitionPath =>
-          val partitionRow = if (isPartitionedTable) { // This is a none partitioned table
-            InternalRow.fromSeq(Seq(""))
+          val partitionRow = if (partitionSchema.fields.length == 0) {
+            // This is a none partitioned table
+            InternalRow.empty
           } else {
-            val partitionSeqs = partitionPath.split("/")
-            assert(partitionSeqs.length == partitionSchema.size,
-              s"size of partition values[size is: ${partitionSeqs.size}, path " +
-                s"is: '$partitionPath'] is not equal to the size of" +
-                s" partition schema field[size is: ${partitionSchema.size}," +
-                s" fields is: ${partitionSchema.json}].")
-            // Append partition name to the partition value.
-            // e.g. convert "/xx/xx/2021/02" to "/xx/xx/year=2021/month=02"
-            val partitionWithName =
-            partitionSeqs.zip(partitionSchema).map {
-              case (partition, field) =>
-                if (partition.indexOf("=") == -1) {
-                  s"${field.name}=$partition"
-                } else {
-                  partition
-                }
-            }.mkString("/")
-            val pathWithPartitionName = new Path(basePath, partitionWithName)
-            val partitionDataTypes = partitionSchema.fields.map(f => f.name -> f.dataType).toMap
-            val partitionValues = PartitionUtils.parsePartition(pathWithPartitionName,
-              typeInference = false, Set(new Path(basePath)), partitionDataTypes,
-              DateTimeUtils.getTimeZone(timeZoneId))
+            val partitionFragments = partitionPath.split("/")
 
-            // Convert partitionValues to InternalRow
-            partitionValues.map(_.literals.map(_.value))
-              .map(InternalRow.fromSeq)
-              .getOrElse(InternalRow.empty)
+            if (partitionFragments.length != partitionSchema.fields.length &&
+              partitionSchema.fields.length == 1) {
+              // If the partition column size is not equal to the partition fragment size
+              // and the partition column size is 1, we map the whole partition path
+              // to the partition column which can benefit from the partition prune.
+              InternalRow.fromSeq(Seq(UTF8String.fromString(partitionPath)))
+            } else if (partitionFragments.length != partitionSchema.fields.length &&
+              partitionSchema.fields.length > 1) {
+              // If the partition column size is not equal to the partition fragments size
+              // and the partition column size > 1, we do not know how to map the partition
+              // fragments to the partition columns. So we trait it as a None Partitioned Table
+              // for the query which do not benefit from the partition prune.
+              InternalRow.empty
+            } else { // If partitionSeqs.length == partitionSchema.fields.length
+
+              // Append partition name to the partition value if the
+              // HIVE_STYLE_PARTITIONING_OPT_KEY is disable.
+              // e.g. convert "/xx/xx/2021/02" to "/xx/xx/year=2021/month=02"
+              val partitionWithName =
+              partitionFragments.zip(partitionSchema).map {
+                case (partition, field) =>
+                  if (partition.indexOf("=") == -1) {
+                    s"${field.name}=$partition"
+                  } else {
+                    partition
+                  }
+              }.mkString("/")
+              val pathWithPartitionName = new Path(basePath, partitionWithName)
+              val partitionDataTypes = partitionSchema.fields.map(f => f.name -> f.dataType).toMap
+              val partitionValues = PartitionUtils.parsePartition(pathWithPartitionName,
+                typeInference = false, Set(new Path(basePath)), partitionDataTypes,
+                DateTimeUtils.getTimeZone(timeZoneId))
+
+              // Convert partitionValues to InternalRow
+              partitionValues.map(_.literals.map(_.value))
+                .map(InternalRow.fromSeq)
+                .getOrElse(InternalRow.empty)
+            }
           }
           val fullPartitionPath = if (partitionPath.isEmpty) {
             new Path(basePath) // This is a none partition path
           } else {
             new Path(basePath, partitionPath)
           }
-          val fs = fullPartitionPath.getFileSystem(serializableConf.get())
-          val filesInPartition = FSUtils.getAllDataFilesInPartition(fs, fullPartitionPath)
+          // Here we use a LocalEngineContext to get the files in the partition.
+          // We can do this because the TableMetadata.getAllFilesInPartition only rely on the
+          // hadoopConf of the EngineContext.
+          val engineContext = new HoodieLocalEngineContext(serializableConf.get())
+          val filesInPartition = FSUtils.getFilesInPartition(engineContext, metadataConfig,
+            basePath, fullPartitionPath)
 
           (PartitionPath(partitionRow, partitionPath), filesInPartition)
         }.collect()
